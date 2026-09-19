@@ -58,6 +58,38 @@ struct AdapterLocation {
         let fm = FileManager.default
         return fm.fileExists(atPath: script.path) && fm.fileExists(atPath: framework.path)
     }
+
+    func process(_ arguments: String...) -> Process {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/perl")
+        process.arguments = [script.path, framework.path] + arguments
+        return process
+    }
+
+    func send(_ command: MediaCommand) {
+        do {
+            try process("send", String(command.rawValue)).run()
+        } catch {
+            warn("failed to send command: \(error.localizedDescription)")
+        }
+    }
+}
+
+// MRCommand IDs
+enum MediaCommand: Int {
+    case play = 0
+    case pause = 1
+    case nextTrack = 4
+    case previousTrack = 5
+
+    var title: String {
+        switch self {
+        case .play: return "Play"
+        case .pause: return "Pause"
+        case .nextTrack: return "Next"
+        case .previousTrack: return "Previous"
+        }
+    }
 }
 
 /// Empty payload: nothing is playing.
@@ -68,7 +100,6 @@ struct AdapterMessage {
 
 /// Messages are delivered on the main queue.
 final class AdapterStream {
-    private static let perl = URL(fileURLWithPath: "/usr/bin/perl")
     private static let restartDelay: TimeInterval = 3
 
     private let location: AdapterLocation
@@ -84,9 +115,7 @@ final class AdapterStream {
     func start() {
         buffer.removeAll()
 
-        let process = Process()
-        process.executableURL = Self.perl
-        process.arguments = [location.script.path, location.framework.path, "stream", "--debounce=250"]
+        let process = location.process("stream", "--debounce=250")
         // stderr is inherited deliberately.
         let pipe = Pipe()
         process.standardOutput = pipe
@@ -103,7 +132,7 @@ final class AdapterStream {
         do {
             try process.run()
         } catch {
-            warn("failed to launch \(Self.perl.path): \(error.localizedDescription)")
+            warn("failed to launch adapter: \(error.localizedDescription)")
             scheduleRestart()
             return
         }
@@ -143,11 +172,13 @@ final class NowPlaying {
     private(set) var title: String?
     private(set) var artist: String?
     private(set) var artwork: NSImage?
+    private(set) var isPlaying = false
 
     func clear() {
         title = nil
         artist = nil
         artwork = nil
+        isPlaying = false
     }
 
     /// In a diff, null clears a field.
@@ -163,6 +194,7 @@ final class NowPlaying {
         if let v = string("title") { title = v }
         if let v = string("artist") { artist = v }
         if let v = string("artworkData") { artwork = v.flatMap { Data(base64Encoded: $0) }.flatMap(menuBarIcon) }
+        if payload.keys.contains("playing") { isPlaying = payload["playing"] as? Bool ?? false }
     }
 }
 
@@ -193,7 +225,7 @@ struct Hold<Value> {
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemValidation {
     private static let holdWindow: TimeInterval = 10
     private static let minTimerDelay: TimeInterval = 0.05
 
@@ -205,7 +237,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }()
 
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    private let playPauseItem = NSMenuItem()
     private let state = NowPlaying()
+    private var location: AdapterLocation?
     private var stream: AdapterStream?
     private var titleHold = Hold<String>()
     private var artworkHold = Hold<NSImage>()
@@ -216,7 +250,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.imagePosition = .imageLeading
 
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        menu.delegate = self
+        menu.addItem(withTitle: "now-playing-bar (\(buildCommit))", action: nil, keyEquivalent: "")
+        menu.addItem(.separator())
+        menu.addItem(playPauseItem)
+        menu.addItem(configured(NSMenuItem(), for: .previousTrack))
+        menu.addItem(configured(NSMenuItem(), for: .nextTrack))
+        menu.addItem(.separator())
+        menu.addItem(withTitle: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         statusItem.menu = menu
 
         trapTerminationSignals()
@@ -227,8 +268,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusItem.button?.toolTip = "mediaremote-adapter not found"
             return
         }
+        self.location = location
         stream = AdapterStream(location: location) { [weak self] in self?.receive($0) }
         stream?.start()
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        configured(playPauseItem, for: state.isPlaying ? .pause : .play)
+    }
+
+    func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        item.action != #selector(sendCommand(_:)) || location != nil
+    }
+
+    @discardableResult
+    private func configured(_ item: NSMenuItem, for command: MediaCommand) -> NSMenuItem {
+        item.title = command.title
+        item.target = self
+        item.action = #selector(sendCommand(_:))
+        item.tag = command.rawValue
+        return item
+    }
+
+    @objc private func sendCommand(_ sender: NSMenuItem) {
+        guard let command = MediaCommand(rawValue: sender.tag) else { return }
+        location?.send(command)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
